@@ -8,10 +8,11 @@ CORS(app, origins="*", supports_credentials=True)
 
 # Airtable configuration
 AIRTABLE_API_KEY = os.environ.get('AIRTABLE_API_KEY')
-AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID', 'appXXXXXXXXXXXXXX')  # Set in Railway
-AIRTABLE_TABLE_NAME = 'Projects'
+AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID', 'appXXXXXXXXXXXXXX')
 
-AIRTABLE_URL = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}'
+# Table URLs
+PROJECTS_URL = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/Projects'
+CLIENTS_URL = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/Clients'
 
 def get_headers():
     return {
@@ -26,39 +27,32 @@ def health():
 @app.route('/clients', methods=['GET'])
 def get_clients():
     """
-    Returns unique list of clients from Projects table.
-    Only includes clients with active projects (In Progress or On Hold).
+    Returns list of clients from Clients table.
+    Sorted alphabetically by name.
     """
     try:
-        # Fetch all records, exclude completed and archived jobs
         params = {
-            'filterByFormula': "AND(NOT({Status}='Completed'), NOT({Status}='Archived'))",
-            'fields[]': ['Client']
+            'fields[]': ['Client code', 'Clients'],
+            'sort[0][field]': 'Clients',
+            'sort[0][direction]': 'asc'
         }
         
-        response = requests.get(AIRTABLE_URL, headers=get_headers(), params=params)
+        response = requests.get(CLIENTS_URL, headers=get_headers(), params=params)
         response.raise_for_status()
         data = response.json()
         
-        # Extract unique clients
-        clients_set = set()
-        for record in data.get('records', []):
-            client = record.get('fields', {}).get('Client', '')
-            if client:
-                clients_set.add(client)
-        
-        # Sort and format
-        clients = sorted(list(clients_set))
-        
-        # Create code from client name (first 3 letters of first word, uppercase)
+        # Format clients
         result = []
-        for client in clients:
-            # Generate a simple code - first 3 chars of first word
-            code = client.split()[0][:3].upper() if client else ''
-            result.append({
-                'code': code,
-                'name': client
-            })
+        for record in data.get('records', []):
+            fields = record.get('fields', {})
+            code = fields.get('Client code', '')
+            name = fields.get('Clients', '')
+            
+            if code and name:
+                result.append({
+                    'code': code,
+                    'name': name
+                })
         
         return jsonify(result)
     
@@ -70,7 +64,7 @@ def get_clients():
 def get_jobs():
     """
     Returns jobs for a specific client.
-    Query param: client (the client name or partial match)
+    Query param: client (the client name)
     Only includes active projects (In Progress or On Hold).
     """
     client_query = request.args.get('client', '')
@@ -79,8 +73,8 @@ def get_jobs():
         return jsonify({'error': 'Client parameter required'}), 400
     
     try:
-        # Filter by client (using FIND for partial match) and exclude completed/archived
-        filter_formula = f"AND(FIND('{client_query}', {{Client}}), NOT({{Status}}='Completed'), NOT({{Status}}='Archived'))"
+        # Filter by exact client match and exclude completed/archived
+        filter_formula = f"AND({{Client}}='{client_query}', NOT({{Status}}='Completed'), NOT({{Status}}='Archived'))"
         
         params = {
             'filterByFormula': filter_formula,
@@ -89,7 +83,7 @@ def get_jobs():
             'sort[0][direction]': 'asc'
         }
         
-        response = requests.get(AIRTABLE_URL, headers=get_headers(), params=params)
+        response = requests.get(PROJECTS_URL, headers=get_headers(), params=params)
         response.raise_for_status()
         data = response.json()
         
@@ -128,7 +122,7 @@ def get_job(job_number):
             'maxRecords': 1
         }
         
-        response = requests.get(AIRTABLE_URL, headers=get_headers(), params=params)
+        response = requests.get(PROJECTS_URL, headers=get_headers(), params=params)
         response.raise_for_status()
         data = response.json()
         
