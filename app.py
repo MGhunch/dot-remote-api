@@ -337,9 +337,9 @@ def update_job_field(job_number):
         for key, value in data.items():
             if key in field_mapping:
                 airtable_key = field_mapping[key]
-                # Handle withClient boolean -> checkbox
+                # Handle withClient boolean -> Airtable checkbox (needs boolean)
                 if key == 'withClient':
-                    value = 'checked' if value else None
+                    value = bool(value)
                 airtable_fields[airtable_key] = value
         
         if not airtable_fields:
