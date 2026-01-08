@@ -70,12 +70,23 @@ def parse_friendly_date(friendly_str):
 
 def parse_status_changed(status_str):
     """
-    Parse 'Status Changed' field like '26/12/2025 11:03am' into ISO date.
+    Parse 'Status Changed' field into ISO date.
+    Airtable API returns ISO format: '2025-12-26T11:03:00.000Z'
+    Display shows: '26/12/2025 11:03am'
     """
     if not status_str:
         return None
     
-    # Try DD/MM/YYYY format
+    # Try ISO format first (what Airtable API actually returns)
+    if 'T' in status_str:
+        try:
+            # Handle '2025-12-26T11:03:00.000Z' format
+            date_part = status_str.split('T')[0]
+            return date_part
+        except:
+            pass
+    
+    # Fallback: Try DD/MM/YYYY format (in case of CSV import)
     match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', status_str)
     if match:
         day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
