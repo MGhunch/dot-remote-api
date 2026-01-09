@@ -523,8 +523,6 @@ def update_tracker_record():
     Update a tracker record.
     Body: {
         "id": "recXXXXX",  # Airtable record ID
-        "projectName": "...",
-        "owner": "...",
         "description": "...",
         "spend": 5000,
         "month": "January",
@@ -541,10 +539,9 @@ def update_tracker_record():
         if not record_id:
             return jsonify({'error': 'Record ID required'}), 400
         
-        # Map frontend fields to Airtable fields
+        # Map frontend fields to Airtable Tracker fields
+        # Note: Project Name and Owner live in Projects table, not Tracker
         field_mapping = {
-            'projectName': 'Project Name',
-            'owner': 'Owner',
             'description': 'Description',
             'spend': 'Spend',
             'month': 'Month',
