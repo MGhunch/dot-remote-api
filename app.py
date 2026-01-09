@@ -384,9 +384,17 @@ def get_tracker_clients():
             if isinstance(monthly_committed, str):
                 monthly_committed = int(monthly_committed.replace('$', '').replace(',', '') or 0)
             
+            # Rollover Credit - could be number or array (from lookup)
             rollover_credit = fields.get('Rollover Credit', 0)
+            if isinstance(rollover_credit, list):
+                rollover_credit = rollover_credit[0] if rollover_credit else 0
             if isinstance(rollover_credit, str):
                 rollover_credit = int(rollover_credit.replace('$', '').replace(',', '') or 0)
+            
+            # Rollover Use In - which quarter this rollover applies to (e.g., "JAN-MAR")
+            rollover_use_in = fields.get('Rollover use', '')
+            if isinstance(rollover_use_in, list):
+                rollover_use_in = rollover_use_in[0] if rollover_use_in else ''
             
             clients.append({
                 'code': fields.get('Client code', ''),
@@ -395,7 +403,7 @@ def get_tracker_clients():
                 'yearEnd': fields.get('Year end', ''),
                 'currentQuarter': fields.get('Current Quarter', ''),
                 'rollover': rollover_credit,
-                'rolloverFrom': fields.get('Rollover', '')  # This seems to be a quarter reference
+                'rolloverUseIn': rollover_use_in
             })
         
         # Filter to only clients with committed spend > 0
