@@ -363,5 +363,179 @@ def update_job_field(job_number):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ============ TRACKER ENDPOINTS ============
+
+@app.route('/tracker/clients')
+def get_tracker_clients():
+    """
+    Get clients with tracker-specific fields (committed spend, rollover, year end)
+    """
+    try:
+        url = get_airtable_url('Clients')
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        
+        records = response.json().get('records', [])
+        clients = []
+        for record in records:
+            fields = record.get('fields', {})
+            monthly_committed = fields.get('Monthly Committed', '$0')
+            # Parse currency string like "$25000" to number
+            if isinstance(monthly_committed, str):
+                monthly_committed = int(monthly_committed.replace('$', '').replace(',', '') or 0)
+            
+            rollover_credit = fields.get('Rollover Credit', 0)
+            if isinstance(rollover_credit, str):
+                rollover_credit = int(rollover_credit.replace('$', '').replace(',', '') or 0)
+            
+            clients.append({
+                'code': fields.get('Client code', ''),
+                'name': fields.get('Clients', ''),
+                'committed': monthly_committed,
+                'yearEnd': fields.get('Year end', ''),
+                'currentQuarter': fields.get('Current Quarter', ''),
+                'rollover': rollover_credit,
+                'rolloverFrom': fields.get('Rollover', '')  # This seems to be a quarter reference
+            })
+        
+        # Filter to only clients with committed spend > 0
+        clients = [c for c in clients if c['committed'] > 0]
+        clients.sort(key=lambda x: x['name'])
+        return jsonify(clients)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tracker/data')
+def get_tracker_data():
+    """
+    Get tracker data for a specific client.
+    Query params:
+    - client: client code (required)
+    """
+    client_code = request.args.get('client')
+    if not client_code:
+        return jsonify({'error': 'client parameter required'}), 400
+    
+    try:
+        url = get_airtable_url('Tracker')
+        
+        # Build filter - get all records for this client
+        filter_formula = f"{{Client Code}} = '{client_code}'"
+        
+        all_records = []
+        offset = None
+        
+        while True:
+            params = {'filterByFormula': filter_formula}
+            if offset:
+                params['offset'] = offset
+            
+            response = requests.get(url, headers=HEADERS, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            records = data.get('records', [])
+            
+            for record in records:
+                fields = record.get('fields', {})
+                
+                # Parse spend - handle currency strings
+                spend = fields.get('Spend', 0)
+                if isinstance(spend, str):
+                    spend = int(spend.replace('$', '').replace(',', '') or 0)
+                
+                all_records.append({
+                    'id': record.get('id'),
+                    'client': fields.get('Client Code', ''),
+                    'jobNumber': fields.get('Job Number', ''),
+                    'projectName': fields.get('Project Name', ''),
+                    'owner': fields.get('Owner', ''),
+                    'description': fields.get('Description', ''),
+                    'spend': spend,
+                    'month': fields.get('Month', ''),
+                    'spendType': fields.get('Spend type', 'Project budget'),
+                    'ballpark': fields.get('Ballpark') == 'checked',
+                    'onUs': fields.get('On us') == 'checked',
+                    'status': fields.get('Status', 'Active')
+                })
+            
+            offset = data.get('offset')
+            if not offset:
+                break
+        
+        return jsonify(all_records)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tracker/update', methods=['POST'])
+def update_tracker_record():
+    """
+    Update a tracker record.
+    Body: {
+        "id": "recXXXXX",  # Airtable record ID
+        "projectName": "...",
+        "owner": "...",
+        "description": "...",
+        "spend": 5000,
+        "month": "January",
+        "spendType": "Project budget",
+        "ballpark": true/false
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        record_id = data.get('id')
+        if not record_id:
+            return jsonify({'error': 'Record ID required'}), 400
+        
+        # Map frontend fields to Airtable fields
+        field_mapping = {
+            'projectName': 'Project Name',
+            'owner': 'Owner',
+            'description': 'Description',
+            'spend': 'Spend',
+            'month': 'Month',
+            'spendType': 'Spend type',
+            'ballpark': 'Ballpark'
+        }
+        
+        airtable_fields = {}
+        for key, value in data.items():
+            if key in field_mapping:
+                airtable_key = field_mapping[key]
+                # Handle ballpark checkbox
+                if key == 'ballpark':
+                    value = 'checked' if value else None
+                airtable_fields[airtable_key] = value
+        
+        if not airtable_fields:
+            return jsonify({'error': 'No valid fields to update'}), 400
+        
+        # Update the record
+        url = f"{get_airtable_url('Tracker')}/{record_id}"
+        response = requests.patch(
+            url,
+            headers=HEADERS,
+            json={'fields': airtable_fields}
+        )
+        response.raise_for_status()
+        
+        return jsonify({
+            'success': True,
+            'recordId': record_id,
+            'updated': list(airtable_fields.keys())
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
