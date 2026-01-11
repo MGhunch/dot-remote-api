@@ -510,8 +510,8 @@ def get_tracker_data():
                     'spend': spend,
                     'month': fields.get('Month', ''),
                     'spendType': fields.get('Spend type', 'Project budget'),
-                    'ballpark': fields.get('Ballpark') == 'checked',
-                    'onUs': fields.get('On us') == 'checked',
+                    'ballpark': bool(fields.get('Ballpark', False)),
+                    'onUs': bool(fields.get('On us', False)),
                     'status': fields.get('Status', 'Active')
                 })
             
