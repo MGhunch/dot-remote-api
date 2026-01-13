@@ -1,7 +1,14 @@
+"""
+Dot Remote API
+Flask server for Airtable integration and Claude processing
+"""
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
 import os
+import json
+import time
 from datetime import datetime
 import re
 
@@ -10,6 +17,7 @@ CORS(app)
 
 AIRTABLE_API_KEY = os.environ.get('AIRTABLE_API_KEY')
 AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID', 'app8CI7NAZqhQ4G1Y')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 
 HEADERS = {
     'Authorization': f'Bearer {AIRTABLE_API_KEY}',
@@ -19,6 +27,48 @@ HEADERS = {
 def get_airtable_url(table):
     return f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}'
 
+
+# ===== CONVERSATION MEMORY =====
+# Simple in-memory store - sessions expire after 30 mins
+conversations = {}
+SESSION_TIMEOUT = 30 * 60  # 30 minutes
+
+def get_conversation(session_id):
+    """Get or create conversation history for a session"""
+    now = time.time()
+    
+    # Clean up old sessions
+    expired = [sid for sid, data in conversations.items() if now - data['last_active'] > SESSION_TIMEOUT]
+    for sid in expired:
+        del conversations[sid]
+    
+    if session_id not in conversations:
+        conversations[session_id] = {
+            'messages': [],
+            'context': {},  # Stores last client, job, etc.
+            'last_active': now
+        }
+    else:
+        conversations[session_id]['last_active'] = now
+    
+    return conversations[session_id]
+
+def add_to_conversation(session_id, role, content):
+    """Add a message to conversation history"""
+    conv = get_conversation(session_id)
+    conv['messages'].append({'role': role, 'content': content})
+    
+    # Keep only last 10 exchanges (20 messages)
+    if len(conv['messages']) > 20:
+        conv['messages'] = conv['messages'][-20:]
+
+def update_context(session_id, context_update):
+    """Update conversation context (last client, job, etc.)"""
+    conv = get_conversation(session_id)
+    conv['context'].update(context_update)
+
+
+# ===== DATE PARSING HELPERS =====
 def parse_friendly_date(friendly_str):
     """
     Parse friendly date formats like 'Wed 14 Jan', 'Mon 05 Jan', 'TBC' 
@@ -150,12 +200,14 @@ def transform_project(record):
         'teamsChannelId': fields.get('Teams Channel ID', '')
     }
 
-# Health check
+
+# ===== HEALTH CHECK =====
 @app.route('/')
 def health():
     return jsonify({'status': 'ok', 'service': 'dot-remote-api'})
 
-# Get all clients
+
+# ===== CLIENTS =====
 @app.route('/clients')
 def get_clients():
     try:
@@ -181,9 +233,11 @@ def get_clients():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Get jobs for a specific client (matches existing format for remote.html)
+
+# ===== JOBS =====
 @app.route('/jobs')
 def get_jobs():
+    """Get jobs for a specific client (matches existing format for remote.html)"""
     client_code = request.args.get('client')
     if not client_code:
         return jsonify({'error': 'client parameter required'}), 400
@@ -213,20 +267,55 @@ def get_jobs():
                 'status': fields.get('Status', 'Incoming')
             })
         
-        # Sort by job number
-        jobs.sort(key=lambda x: x['id'])
         return jsonify(jobs)
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Get single job by job number
-@app.route('/job/<job_number>')
-def get_job(job_number):
+
+@app.route('/jobs/all')
+def get_all_jobs():
+    """Get all active jobs for What's What / WIP board"""
     try:
         url = get_airtable_url('Projects')
         params = {
-            'filterByFormula': f"{{Job Number}} = '{job_number}'"
+            'filterByFormula': "NOT({Status} = 'Archived')"
+        }
+        
+        all_records = []
+        offset = None
+        
+        while True:
+            if offset:
+                params['offset'] = offset
+            
+            response = requests.get(url, headers=HEADERS, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            for record in data.get('records', []):
+                all_records.append(transform_project(record))
+            
+            offset = data.get('offset')
+            if not offset:
+                break
+        
+        # Sort by update due date
+        all_records.sort(key=lambda x: x['updateDue'] or '9999-99-99')
+        return jsonify(all_records)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/job/<job_number>')
+def get_job(job_number):
+    """Get a single job by job number"""
+    try:
+        url = get_airtable_url('Projects')
+        params = {
+            'filterByFormula': f"{{Job Number}} = '{job_number}'",
+            'maxRecords': 1
         }
         response = requests.get(url, headers=HEADERS, params=params)
         response.raise_for_status()
@@ -240,70 +329,10 @@ def get_job(job_number):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# NEW: Get ALL active jobs (for To Do / WIP views)
-@app.route('/jobs/all')
-def get_all_jobs():
-    """
-    Returns all active jobs (not Completed/Archived) for To Do and WIP views.
-    Optional query params:
-    - status: filter by specific status
-    - include_completed: set to 'true' to include completed jobs
-    """
-    try:
-        include_completed = request.args.get('include_completed', 'false').lower() == 'true'
-        status_filter = request.args.get('status')
-        
-        url = get_airtable_url('Projects')
-        
-        # Build filter formula
-        if status_filter:
-            filter_formula = f"{{Status}} = '{status_filter}'"
-        elif include_completed:
-            filter_formula = "NOT({{Status}} = 'Archived')"
-        else:
-            filter_formula = "NOT(OR({Status} = 'Completed', {Status} = 'Archived'))"
-        
-        all_jobs = []
-        offset = None
-        
-        # Handle pagination (Airtable returns max 100 records per request)
-        while True:
-            params = {'filterByFormula': filter_formula}
-            if offset:
-                params['offset'] = offset
-            
-            response = requests.get(url, headers=HEADERS, params=params)
-            response.raise_for_status()
-            
-            data = response.json()
-            records = data.get('records', [])
-            all_jobs.extend([transform_project(r) for r in records])
-            
-            offset = data.get('offset')
-            if not offset:
-                break
-        
-        # Sort by update due date (soonest first), nulls last
-        def sort_key(job):
-            if job['updateDue']:
-                return (0, job['updateDue'])
-            return (1, '9999-99-99')
-        
-        all_jobs.sort(key=sort_key)
-        
-        return jsonify(all_jobs)
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-# Update a job field
 @app.route('/job/<job_number>/update', methods=['POST'])
-def update_job_field(job_number):
-    """
-    Update specific fields on a job.
-    Body: { "field": "value", ... }
-    Supported fields: stage, status, withClient, updateDue, liveDate
-    """
+def update_job(job_number):
+    """Update a job's fields"""
     try:
         data = request.get_json()
         if not data:
@@ -312,7 +341,8 @@ def update_job_field(job_number):
         # First, find the record ID
         url = get_airtable_url('Projects')
         params = {
-            'filterByFormula': f"{{Job Number}} = '{job_number}'"
+            'filterByFormula': f"{{Job Number}} = '{job_number}'",
+            'maxRecords': 1
         }
         response = requests.get(url, headers=HEADERS, params=params)
         response.raise_for_status()
@@ -327,49 +357,38 @@ def update_job_field(job_number):
         field_mapping = {
             'stage': 'Stage',
             'status': 'Status',
-            'withClient': 'With Client?',
-            'updateDue': 'Update due',
-            'liveDate': 'Live Date'
+            'updateDue': 'Update due friendly',
+            'liveDate': 'Live Date',
+            'withClient': 'With Client?'
         }
         
-        # Build update payload
         airtable_fields = {}
         for key, value in data.items():
             if key in field_mapping:
-                airtable_key = field_mapping[key]
-                # Handle withClient boolean -> Airtable checkbox (needs boolean)
-                if key == 'withClient':
-                    value = bool(value)
-                airtable_fields[airtable_key] = value
+                airtable_fields[field_mapping[key]] = value
         
         if not airtable_fields:
             return jsonify({'error': 'No valid fields to update'}), 400
         
         # Update the record
         update_url = f"{url}/{record_id}"
-        update_response = requests.patch(
+        response = requests.patch(
             update_url,
             headers=HEADERS,
             json={'fields': airtable_fields}
         )
-        update_response.raise_for_status()
+        response.raise_for_status()
         
-        return jsonify({
-            'success': True,
-            'jobNumber': job_number,
-            'updated': list(airtable_fields.keys())
-        })
+        return jsonify({'success': True, 'updated': list(airtable_fields.keys())})
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ============ TRACKER ENDPOINTS ============
 
+# ===== TRACKER =====
 @app.route('/tracker/clients')
 def get_tracker_clients():
-    """
-    Get clients with tracker-specific fields (committed spend, rollover, year end)
-    """
+    """Get clients with committed retainer budgets for tracker"""
     try:
         url = get_airtable_url('Clients')
         response = requests.get(url, headers=HEADERS)
@@ -377,9 +396,12 @@ def get_tracker_clients():
         
         records = response.json().get('records', [])
         clients = []
+        
         for record in records:
             fields = record.get('fields', {})
-            monthly_committed = fields.get('Monthly Committed', '$0')
+            
+            # Monthly Committed - could be number or currency string
+            monthly_committed = fields.get('Monthly Committed', 0)
             # Parse currency string like "$25000" to number
             if isinstance(monthly_committed, str):
                 monthly_committed = int(monthly_committed.replace('$', '').replace(',', '') or 0)
@@ -587,6 +609,166 @@ def update_tracker_record():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ===== CLAUDE PARSE (Query Understanding with Memory) =====
+@app.route('/claude/parse', methods=['POST'])
+def claude_parse():
+    """
+    Parse a natural language query using Claude
+    Returns structured intent for the frontend to execute
+    """
+    data = request.get_json()
+    question = data.get('question', '')
+    clients = data.get('clients', [])
+    session_id = data.get('sessionId', 'default')
+    
+    if not question:
+        return jsonify({'error': 'No question provided'}), 400
+    
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'Anthropic API not configured'}), 500
+    
+    try:
+        # Get conversation history and context
+        conv = get_conversation(session_id)
+        history = conv['messages']
+        context = conv['context']
+        
+        # Build client list for prompt
+        client_list = ', '.join([f"{c['code']} ({c['name']})" for c in clients])
+        
+        # Build context hint
+        context_hint = ""
+        if context.get('lastClient'):
+            context_hint += f"Last discussed client: {context['lastClient']}. "
+        if context.get('lastJob'):
+            context_hint += f"Last discussed job: {context['lastJob']}. "
+        
+        system_prompt = f"""You are Dot, the project assistant for Hunch creative agency. You're helpful, a little cheeky, and you know your limits.
+
+WHAT YOU CAN DO:
+- Find jobs and projects (by client, status, due date)
+- Show what's due, overdue, on hold, with client
+- Open the budget tracker
+- Help people navigate the system
+
+WHAT YOU CAN'T DO:
+- Answer general knowledge questions
+- Give opinions on creative work
+- Predict the future
+- Make coffee (yet)
+
+AVAILABLE CLIENTS: {client_list}
+
+CONVERSATION CONTEXT: {context_hint if context_hint else 'None yet'}
+
+RESPONSE FORMAT:
+Return ONLY valid JSON in this exact format:
+{{
+    "coreRequest": "FIND" | "DUE" | "UPDATE" | "TRACKER" | "HELP" | "UNKNOWN",
+    "modifiers": {{
+        "client": "CLIENT_CODE or null",
+        "status": "In Progress" | "On Hold" | "Incoming" | "Completed" | null,
+        "withClient": true | false | null,
+        "dateRange": "today" | "tomorrow" | "week" | "next" | null
+    }},
+    "searchTerms": [],
+    "understood": true | false,
+    "fallbackMessage": "Only if understood is false - a cheeky one-liner explaining you can't help with that"
+}}
+
+PARSING RULES:
+- If user says "them", "that client", "those" - refer to the last discussed client in context
+- If user mentions a client name or code, set modifiers.client to the CLIENT_CODE
+- "on hold", "waiting", "paused" → status: "On Hold"
+- "with client", "with them", "waiting on client" → withClient: true
+- "due", "overdue", "deadline", "urgent" → coreRequest: "DUE"
+- "show", "list", "find", "check", "all jobs" → coreRequest: "FIND"
+- "budget", "spend", "tracker" → coreRequest: "TRACKER"
+- Keep searchTerms empty unless user is searching for specific job keywords
+
+WHEN YOU CAN'T HELP:
+If the question is outside your scope, set understood: false and write a short, cheeky fallbackMessage. Channel a robot with heart. Examples:
+- "I'm a robot, not a search engine. Try Google?"
+- "That's above my pay grade. I just do projects."
+- "I'm flattered you think I know that, but... no."
+- "Beep boop, does not compute. Job stuff only!"
+- "I'm a project bot, not a therapist. Beer o'clock?"
+- "My talents are limited to jobs and deadlines. Tragic, I know."
+
+Keep fallbackMessages short (under 15 words), warm, and a little self-deprecating. Never be mean."""
+
+        # Build messages with history
+        messages = []
+        for msg in history[-10:]:  # Last 5 exchanges
+            messages.append(msg)
+        messages.append({'role': 'user', 'content': question})
+        
+        response = requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json'
+            },
+            json={
+                'model': 'claude-sonnet-4-20250514',
+                'max_tokens': 500,
+                'system': system_prompt,
+                'messages': messages
+            }
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        # Extract Claude's response
+        assistant_message = result.get('content', [{}])[0].get('text', '{}')
+        
+        # Try to parse as JSON
+        try:
+            # Clean up response - sometimes Claude adds markdown
+            clean_message = assistant_message.strip()
+            if clean_message.startswith('```'):
+                clean_message = clean_message.split('```')[1]
+                if clean_message.startswith('json'):
+                    clean_message = clean_message[4:]
+            clean_message = clean_message.strip()
+            
+            parsed = json.loads(clean_message)
+            
+            # Update conversation history
+            add_to_conversation(session_id, 'user', question)
+            add_to_conversation(session_id, 'assistant', f"Parsed: {parsed.get('coreRequest')} for {parsed.get('modifiers', {}).get('client', 'no client')}")
+            
+            # Update context
+            if parsed.get('modifiers', {}).get('client'):
+                update_context(session_id, {'lastClient': parsed['modifiers']['client']})
+            
+            return jsonify({'parsed': parsed})
+            
+        except json.JSONDecodeError as e:
+            print(f'JSON parse error: {e}')
+            print(f'Raw response: {assistant_message}')
+            return jsonify({'parsed': None, 'error': 'Could not parse response'})
+    
+    except Exception as e:
+        print(f'Error calling Claude: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ===== CLEAR SESSION =====
+@app.route('/claude/clear', methods=['POST'])
+def clear_session():
+    """Clear conversation history for a session"""
+    data = request.get_json()
+    session_id = data.get('sessionId', 'default')
+    
+    if session_id in conversations:
+        del conversations[session_id]
+    
+    return jsonify({'success': True})
 
 
 if __name__ == '__main__':
