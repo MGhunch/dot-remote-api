@@ -174,6 +174,56 @@ def get_clients():
         return jsonify({'error': str(e)}), 500
 
 
+# ===== PEOPLE =====
+@app.route('/people/<client_code>')
+def get_people_for_client(client_code):
+    """Get people/contacts for a specific client"""
+    try:
+        url = get_airtable_url('People')
+        
+        # Handle One NZ divisions - search for ONE, ONB, or ONS
+        if client_code in ['ONE', 'ONB', 'ONS']:
+            filter_formula = "AND({Active} = TRUE(), OR({Client Link} = 'ONE', {Client Link} = 'ONB', {Client Link} = 'ONS'))"
+        else:
+            filter_formula = f"AND({{Active}} = TRUE(), {{Client Link}} = '{client_code}')"
+        
+        params = {
+            'filterByFormula': filter_formula
+        }
+        
+        all_people = []
+        offset = None
+        
+        while True:
+            if offset:
+                params['offset'] = offset
+            
+            response = requests.get(url, headers=HEADERS, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            for record in data.get('records', []):
+                fields = record.get('fields', {})
+                name = fields.get('Name', fields.get('Full name', ''))
+                if name:
+                    all_people.append({
+                        'name': name,
+                        'email': fields.get('Email Address', ''),
+                        'clientCode': fields.get('Client Link', '')
+                    })
+            
+            offset = data.get('offset')
+            if not offset:
+                break
+        
+        # Sort by name
+        all_people.sort(key=lambda x: x['name'])
+        return jsonify(all_people)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # ===== JOBS =====
 @app.route('/jobs/all')
 def get_all_jobs():
