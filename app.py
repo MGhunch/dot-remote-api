@@ -1344,7 +1344,7 @@ AVAILABLE CLIENTS: {client_list}
 
 These are company names:
 - "Sky" = SKY (Sky TV) - never the weather
-- "One" = One NZ (Marketing, Business, or Simplification division)
+- "One" / "One NZ" = THREE separate client codes: ONE (Marketing), ONB (Business), ONS (Simplification). When someone asks about "One NZ" contacts or people, search ALL THREE codes and combine the results. Ask for clarification only if they specifically need one division.
 - "Tower" = TOW (Tower Insurance) - never a building
 - "Fisher" = FIS (Fisher Funds)
 
@@ -1489,7 +1489,13 @@ REMEMBER: You're helpful first. Most questions have a yes answer. Find it."""
             
             # Second API call with tool results
             messages.append({'role': 'assistant', 'content': content_blocks})
-            messages.append({'role': 'user', 'content': tool_results})
+            
+            # Add tool results with a reminder to return JSON
+            tool_results_with_reminder = tool_results + [{
+                'type': 'text',
+                'text': 'Now respond with ONLY valid JSON in the required format. No other text.'
+            }]
+            messages.append({'role': 'user', 'content': tool_results_with_reminder})
             
             response2 = requests.post(
                 'https://api.anthropic.com/v1/messages',
