@@ -439,6 +439,10 @@ def get_tracker_data():
                 fields = record.get('fields', {})
                 job_number = fields.get('Job Number', '')
                 
+                # Handle linked field (returns as list)
+                if isinstance(job_number, list):
+                    job_number = job_number[0] if job_number else ''
+                
                 spend = fields.get('Spend', 0)
                 if isinstance(spend, str):
                     spend = float(spend.replace('$', '').replace(',', '') or 0)
