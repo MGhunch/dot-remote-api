@@ -149,7 +149,7 @@ def transform_project(record):
         'jobName': fields.get('Project Name', ''),
         'clientCode': extract_client_code(job_number),
         'client': fields.get('Client', ''),
-        'description': fields.get('Tracker notes', ''),
+        'description': fields.get('Description', ''),
         'projectOwner': fields.get('Project Owner', ''),
         'update': latest_update,
         'updateDue': update_due,
