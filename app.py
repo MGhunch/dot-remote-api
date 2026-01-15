@@ -426,7 +426,7 @@ def get_tracker_data():
         
         while True:
             params = {
-                'filterByFormula': f"{{Client}} = '{client_code}'"
+                'filterByFormula': f"FIND('{client_code}', {{Job Number}})"
             }
             if offset:
                 params['offset'] = offset
