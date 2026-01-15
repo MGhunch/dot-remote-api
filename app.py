@@ -1,6 +1,7 @@
 """
 Dot Remote API
 Flask server for Airtable integration and Claude processing
+Enhanced with Airtable tool access for Ask Dot
 """
 
 from flask import Flask, jsonify, request
@@ -207,6 +208,76 @@ def health():
     return jsonify({'status': 'ok', 'service': 'dot-remote-api'})
 
 
+# ===== PIN VALIDATION =====
+@app.route('/pin/validate', methods=['POST'])
+def validate_pin():
+    """
+    Validate a PIN and return user permissions.
+    Checks People table first, then falls back to hardcoded Hunch PINs.
+    Returns: { valid, mode, clientCode, trackerAccess, name, fullName }
+    """
+    data = request.get_json()
+    pin = data.get('pin', '')
+    
+    if not pin or len(pin) != 4:
+        return jsonify({'valid': False, 'error': 'Invalid PIN format'}), 400
+    
+    # Hardcoded Hunch team PINs (fallback)
+    HUNCH_PINS = {
+        '9871': {'name': 'Michael', 'fullName': 'Michael Goldthorpe', 'mode': 'hunch', 'trackerAccess': True},
+        '1919': {'name': 'Team', 'fullName': 'Hunch Team', 'mode': 'hunch', 'trackerAccess': True}
+    }
+    
+    # Check hardcoded PINs first (for Hunch team)
+    if pin in HUNCH_PINS:
+        user = HUNCH_PINS[pin]
+        return jsonify({
+            'valid': True,
+            'mode': user['mode'],
+            'clientCode': None,
+            'trackerAccess': user['trackerAccess'],
+            'name': user['name'],
+            'fullName': user['fullName']
+        })
+    
+    # Check People table for client PINs
+    try:
+        url = get_airtable_url('People')
+        params = {
+            'filterByFormula': f"{{Pin}} = '{pin}'",
+            'maxRecords': 1
+        }
+        response = requests.get(url, headers=HEADERS, params=params)
+        response.raise_for_status()
+        
+        records = response.json().get('records', [])
+        if records:
+            fields = records[0].get('fields', {})
+            client_link = fields.get('Client Link', '')
+            
+            # Handle if Client Link is an array (linked record)
+            if isinstance(client_link, list):
+                client_link = client_link[0] if client_link else ''
+            
+            first_name = fields.get('First Name', '')
+            full_name = fields.get('Name', fields.get('Full name', first_name))
+            
+            return jsonify({
+                'valid': True,
+                'mode': 'client',
+                'clientCode': client_link,
+                'trackerAccess': False,  # Clients don't get tracker access by default
+                'name': first_name or full_name.split()[0] if full_name else 'Guest',
+                'fullName': full_name
+            })
+    
+    except Exception as e:
+        print(f'PIN lookup error: {e}')
+        # Fall through to invalid
+    
+    return jsonify({'valid': False, 'error': 'PIN not recognised'})
+
+
 # ===== CLIENTS =====
 @app.route('/clients')
 def get_clients():
@@ -229,6 +300,141 @@ def get_clients():
         # Sort by name
         clients.sort(key=lambda x: x['name'])
         return jsonify(clients)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/clients/detail/<client_code>')
+def get_client_detail(client_code):
+    """
+    Get detailed client info including commercial setup.
+    Used by Dot when answering questions about a specific client.
+    """
+    try:
+        url = get_airtable_url('Clients')
+        params = {
+            'filterByFormula': f"{{Client code}} = '{client_code}'",
+            'maxRecords': 1
+        }
+        response = requests.get(url, headers=HEADERS, params=params)
+        response.raise_for_status()
+        
+        records = response.json().get('records', [])
+        if not records:
+            return jsonify({'error': f'Client {client_code} not found'}), 404
+        
+        fields = records[0].get('fields', {})
+        
+        # Parse currency fields
+        def parse_currency(val):
+            if isinstance(val, (int, float)):
+                return val
+            if isinstance(val, str):
+                return int(val.replace('$', '').replace(',', '') or 0)
+            return 0
+        
+        # Parse rollover (might be array from lookup)
+        rollover = fields.get('Rollover Credit', 0)
+        if isinstance(rollover, list):
+            rollover = rollover[0] if rollover else 0
+        rollover = parse_currency(rollover)
+        
+        return jsonify({
+            'code': client_code,
+            'name': fields.get('Clients', ''),
+            'yearEnd': fields.get('Year end', ''),
+            'currentQuarter': fields.get('Current Quarter', ''),
+            'monthlyCommitted': parse_currency(fields.get('Monthly Committed', 0)),
+            'quarterlyCommitted': parse_currency(fields.get('Quarterly Committed', 0)),
+            'thisMonth': parse_currency(fields.get('This month', 0)),
+            'thisQuarter': parse_currency(fields.get('This Quarter', 0)),
+            'undersOvers': parse_currency(fields.get('Unders/Overs', 0)),
+            'rolloverCredit': rollover,
+            'teamsId': fields.get('Teams ID', ''),
+            'sharepointUrl': fields.get('Sharepoint ID', '')
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ===== PEOPLE =====
+@app.route('/people')
+def get_people():
+    """
+    Search People table.
+    Query params:
+    - client: filter by client code (optional)
+    - search: search term for name/email (optional)
+    - active: filter to active only (default true)
+    """
+    client_code = request.args.get('client')
+    search_term = request.args.get('search', '').lower()
+    active_only = request.args.get('active', 'true').lower() == 'true'
+    
+    try:
+        url = get_airtable_url('People')
+        
+        # Build filter formula
+        filters = []
+        if client_code:
+            filters.append(f"{{Client Link}} = '{client_code}'")
+        if active_only:
+            filters.append("{Active} = TRUE()")
+        
+        params = {}
+        if filters:
+            params['filterByFormula'] = f"AND({', '.join(filters)})" if len(filters) > 1 else filters[0]
+        
+        all_people = []
+        offset = None
+        
+        while True:
+            if offset:
+                params['offset'] = offset
+            
+            response = requests.get(url, headers=HEADERS, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            for record in data.get('records', []):
+                fields = record.get('fields', {})
+                name = fields.get('Name', fields.get('Full name', ''))
+                
+                # Skip empty records
+                if not name:
+                    continue
+                
+                # Apply search filter (client-side for flexibility)
+                if search_term:
+                    searchable = f"{name} {fields.get('Email Address', '')}".lower()
+                    if search_term not in searchable:
+                        continue
+                
+                all_people.append({
+                    'name': name,
+                    'firstName': fields.get('First Name', ''),
+                    'lastName': fields.get('Last Name', ''),
+                    'email': fields.get('Email Address', ''),
+                    'phone': fields.get('Phone Number', ''),
+                    'clientCode': fields.get('Client Link', ''),
+                    'active': bool(fields.get('Active', False)),
+                    'birthday': fields.get('Birthday', ''),
+                    'notes': fields.get('Notes', '')
+                })
+            
+            offset = data.get('offset')
+            if not offset:
+                break
+        
+        # Sort by name
+        all_people.sort(key=lambda x: x['name'])
+        
+        return jsonify({
+            'count': len(all_people),
+            'people': all_people
+        })
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -778,17 +984,316 @@ def get_tracker_summary():
         return jsonify({'error': str(e)}), 500
 
 
-# ===== CLAUDE PARSE (Query Understanding with Memory) =====
+# ===== AIRTABLE TOOLS FOR CLAUDE =====
+# These functions are called by Claude during tool use
+
+def tool_search_people(client_code=None, search_term=None, active_only=True):
+    """
+    Search People table. Returns formatted results for Claude.
+    """
+    try:
+        url = get_airtable_url('People')
+        
+        filters = []
+        if client_code:
+            filters.append(f"{{Client Link}} = '{client_code}'")
+        if active_only:
+            filters.append("{Active} = TRUE()")
+        
+        params = {}
+        if filters:
+            params['filterByFormula'] = f"AND({', '.join(filters)})" if len(filters) > 1 else filters[0]
+        
+        all_people = []
+        offset = None
+        
+        while True:
+            if offset:
+                params['offset'] = offset
+            
+            response = requests.get(url, headers=HEADERS, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            for record in data.get('records', []):
+                fields = record.get('fields', {})
+                name = fields.get('Name', fields.get('Full name', ''))
+                if not name:
+                    continue
+                
+                if search_term:
+                    searchable = f"{name} {fields.get('Email Address', '')}".lower()
+                    if search_term.lower() not in searchable:
+                        continue
+                
+                all_people.append({
+                    'name': name,
+                    'email': fields.get('Email Address', ''),
+                    'phone': fields.get('Phone Number', ''),
+                    'clientCode': fields.get('Client Link', '')
+                })
+            
+            offset = data.get('offset')
+            if not offset:
+                break
+        
+        return {'count': len(all_people), 'people': all_people}
+    
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def tool_get_client_detail(client_code):
+    """
+    Get detailed client info. Returns formatted results for Claude.
+    """
+    try:
+        url = get_airtable_url('Clients')
+        params = {
+            'filterByFormula': f"{{Client code}} = '{client_code}'",
+            'maxRecords': 1
+        }
+        response = requests.get(url, headers=HEADERS, params=params)
+        response.raise_for_status()
+        
+        records = response.json().get('records', [])
+        if not records:
+            return {'error': f'Client {client_code} not found'}
+        
+        fields = records[0].get('fields', {})
+        
+        def parse_currency(val):
+            if isinstance(val, (int, float)):
+                return val
+            if isinstance(val, str):
+                return int(val.replace('$', '').replace(',', '') or 0)
+            return 0
+        
+        rollover = fields.get('Rollover Credit', 0)
+        if isinstance(rollover, list):
+            rollover = rollover[0] if rollover else 0
+        rollover = parse_currency(rollover)
+        
+        return {
+            'code': client_code,
+            'name': fields.get('Clients', ''),
+            'yearEnd': fields.get('Year end', ''),
+            'currentQuarter': fields.get('Current Quarter', ''),
+            'monthlyCommitted': parse_currency(fields.get('Monthly Committed', 0)),
+            'quarterlyCommitted': parse_currency(fields.get('Quarterly Committed', 0)),
+            'thisMonth': parse_currency(fields.get('This month', 0)),
+            'thisQuarter': parse_currency(fields.get('This Quarter', 0)),
+            'rolloverCredit': rollover
+        }
+    
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def tool_get_spend_summary(client_code, period='this_month'):
+    """
+    Get spend summary for a client. Returns formatted results for Claude.
+    """
+    try:
+        # Reuse the existing tracker summary logic
+        # This is a simplified version for tool use
+        clients_url = get_airtable_url('Clients')
+        clients_response = requests.get(clients_url, headers=HEADERS)
+        clients_response.raise_for_status()
+        
+        client_info = None
+        for record in clients_response.json().get('records', []):
+            fields = record.get('fields', {})
+            if fields.get('Client code', '') == client_code:
+                monthly = fields.get('Monthly Committed', 0)
+                if isinstance(monthly, str):
+                    monthly = int(monthly.replace('$', '').replace(',', '') or 0)
+                
+                rollover = fields.get('Rollover Credit', 0)
+                if isinstance(rollover, list):
+                    rollover = rollover[0] if rollover else 0
+                if isinstance(rollover, str):
+                    rollover = int(rollover.replace('$', '').replace(',', '') or 0)
+                
+                client_info = {
+                    'name': fields.get('Clients', ''),
+                    'monthlyBudget': monthly,
+                    'rollover': rollover
+                }
+                break
+        
+        if not client_info:
+            return {'error': f'Client {client_code} not found'}
+        
+        # Determine months to query
+        now = datetime.now()
+        current_month = now.strftime('%B')
+        current_month_num = now.month
+        
+        months_to_query = []
+        is_quarter = False
+        
+        if period == 'this_month':
+            months_to_query = [current_month]
+        elif period == 'this_quarter':
+            is_quarter = True
+            quarter = (current_month_num - 1) // 3 + 1
+            quarter_months = {
+                1: ['January', 'February', 'March'],
+                2: ['April', 'May', 'June'],
+                3: ['July', 'August', 'September'],
+                4: ['October', 'November', 'December']
+            }
+            months_to_query = quarter_months.get(quarter, [])
+        elif period in ['Q1', 'Q2', 'Q3', 'Q4']:
+            is_quarter = True
+            quarter_months = {
+                'Q1': ['January', 'February', 'March'],
+                'Q2': ['April', 'May', 'June'],
+                'Q3': ['July', 'August', 'September'],
+                'Q4': ['October', 'November', 'December']
+            }
+            months_to_query = quarter_months.get(period, [])
+        else:
+            months_to_query = [period.capitalize()]
+        
+        # Sum spend
+        tracker_url = get_airtable_url('Tracker')
+        tracker_filter = f"{{Client Code}} = '{client_code}'"
+        
+        total_spent = 0
+        offset = None
+        
+        while True:
+            params = {'filterByFormula': tracker_filter}
+            if offset:
+                params['offset'] = offset
+            
+            response = requests.get(tracker_url, headers=HEADERS, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            for record in data.get('records', []):
+                fields = record.get('fields', {})
+                month = fields.get('Month', '')
+                
+                if month in months_to_query:
+                    spend = fields.get('Spend', 0)
+                    if isinstance(spend, str):
+                        spend = int(spend.replace('$', '').replace(',', '') or 0)
+                    if not fields.get('On us', False):
+                        total_spent += spend
+            
+            offset = data.get('offset')
+            if not offset:
+                break
+        
+        budget = client_info['monthlyBudget'] * (3 if is_quarter else 1)
+        if is_quarter:
+            budget += client_info['rollover']
+        
+        return {
+            'client': client_info['name'],
+            'clientCode': client_code,
+            'period': period,
+            'budget': budget,
+            'spent': total_spent,
+            'remaining': budget - total_spent,
+            'percentUsed': round((total_spent / budget * 100) if budget > 0 else 0)
+        }
+    
+    except Exception as e:
+        return {'error': str(e)}
+
+
+# Tool definitions for Claude
+CLAUDE_TOOLS = [
+    {
+        "name": "search_people",
+        "description": "Search for contacts/people in the database. Use this when asked about client contacts, email addresses, phone numbers, or how many people work at a client.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "client_code": {
+                    "type": "string",
+                    "description": "Filter by client code (e.g., 'SKY', 'TOW', 'ONE'). Optional."
+                },
+                "search_term": {
+                    "type": "string",
+                    "description": "Search for a specific person by name or email. Optional."
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_client_detail",
+        "description": "Get detailed information about a client including their budget, quarter, and commercial setup. Use this when asked about a client's retainer, budget, or financial setup.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "client_code": {
+                    "type": "string",
+                    "description": "The client code (e.g., 'SKY', 'TOW', 'ONE')"
+                }
+            },
+            "required": ["client_code"]
+        }
+    },
+    {
+        "name": "get_spend_summary",
+        "description": "Get spend/budget summary for a client. Use this when asked about how much has been spent, budget remaining, or financial tracking.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "client_code": {
+                    "type": "string",
+                    "description": "The client code (e.g., 'SKY', 'TOW', 'ONE')"
+                },
+                "period": {
+                    "type": "string",
+                    "description": "Time period: 'this_month', 'this_quarter', 'Q1', 'Q2', 'Q3', 'Q4', or a month name like 'January'"
+                }
+            },
+            "required": ["client_code"]
+        }
+    }
+]
+
+
+def execute_tool(tool_name, tool_input):
+    """Execute a tool and return results"""
+    if tool_name == "search_people":
+        return tool_search_people(
+            client_code=tool_input.get('client_code'),
+            search_term=tool_input.get('search_term')
+        )
+    elif tool_name == "get_client_detail":
+        return tool_get_client_detail(tool_input.get('client_code'))
+    elif tool_name == "get_spend_summary":
+        return tool_get_spend_summary(
+            client_code=tool_input.get('client_code'),
+            period=tool_input.get('period', 'this_month')
+        )
+    else:
+        return {'error': f'Unknown tool: {tool_name}'}
+
+
+# ===== CLAUDE PARSE (Query Understanding with Memory and Tools) =====
 @app.route('/claude/parse', methods=['POST'])
 def claude_parse():
     """
-    Parse a natural language query using Claude
-    Returns structured intent for the frontend to execute
+    Parse a natural language query using Claude.
+    Now supports tool use for data lookups.
+    Returns structured intent for the frontend to execute.
     """
     data = request.get_json()
     question = data.get('question', '')
     clients = data.get('clients', [])
     session_id = data.get('sessionId', 'default')
+    user_mode = data.get('userMode', 'hunch')  # 'hunch' or 'client'
+    user_client = data.get('userClient')  # client code if mode is 'client'
+    tracker_access = data.get('trackerAccess', True)
     
     if not question:
         return jsonify({'error': 'No question provided'}), 400
@@ -812,6 +1317,13 @@ def claude_parse():
         if context.get('lastJob'):
             context_hint += f"Last discussed job: {context['lastJob']}. "
         
+        # Permission context
+        permission_hint = ""
+        if user_mode == 'client':
+            permission_hint = f"User is a CLIENT viewing as {user_client}. Only show them data for their client. "
+            if not tracker_access:
+                permission_hint += "They do NOT have access to financial/tracker data. "
+        
         system_prompt = f"""You are Dot, the admin-bot for Hunch creative agency.
 
 WHO YOU ARE:
@@ -823,7 +1335,7 @@ WHAT YOU KNOW:
 You have access to Hunch's Airtable database:
 - PROJECTS: Job number, name, description, stage, status, due dates, updates, Teams links
 - CLIENTS: Client name, code, Teams IDs
-- PEOPLE: Contact names, emails, phone numbers, PINs
+- PEOPLE: Contact names, emails, phone numbers
 - TRACKER: Budget, spend, and numbers by client and quarter
 
 You can search, filter, sort, and retrieve any of this information.
@@ -837,6 +1349,20 @@ These are company names:
 - "Fisher" = FIS (Fisher Funds)
 
 CONVERSATION CONTEXT: {context_hint if context_hint else 'Fresh conversation.'}
+{permission_hint}
+
+TOOLS:
+You have access to tools that can look up data. Use them when:
+- Asked about contacts/people (search_people)
+- Asked about client details/setup (get_client_detail)
+- Asked about spend/budget that isn't in the preloaded data (get_spend_summary)
+
+The frontend already has Projects preloaded, so for job queries, just return the intent - don't use tools.
+
+CONFIDENCE:
+- If you can answer from context or the question is about jobs (which are preloaded), answer directly
+- If you need data you don't have (people, detailed client info, specific spend queries), use a tool
+- If you're not sure you have the right data, say so and offer to dig deeper
 
 RESPONSE FORMAT:
 Return ONLY valid JSON:
@@ -845,7 +1371,7 @@ Return ONLY valid JSON:
 REQUEST TYPES:
 - FIND: Looking for jobs ("Show me Sky jobs", "What's on hold?")
 - DUE: Deadline queries ("What's due today?", "What's overdue?")
-- QUERY: Data lookups ("Who's our contact at Fisher?", "What's Sarah's email?")
+- QUERY: Data lookups - USE TOOLS for these ("Who's our contact at Fisher?", "What's Sarah's email?", "How many people at Tower?")
 - TRACKER: Budget/spend/numbers queries. Examples:
   - "How's Tower tracking?" → TRACKER, client: TOW, period: this_month
   - "Where did One NZ land last month?" → TRACKER, client: ONE, period: last_month
@@ -864,6 +1390,8 @@ RESPONSE TEXT:
 This is what the user sees. Make it warm, natural, and fun.
 Good: "Here's what's on for Sky:" / "Found it!" / "3 jobs due today - let's get after them:"
 Bad: "I found the following jobs:" / "Based on your query:"
+
+If you used a tool to get data, incorporate that data naturally into your responseText.
 
 WHEN YOU CANNOT HELP:
 If outside your scope, set understood to false and write a warm fallback.
@@ -888,6 +1416,32 @@ REMEMBER: You're helpful first. Most questions have a yes answer. Find it."""
             messages.append(msg)
         messages.append({'role': 'user', 'content': question})
         
+        # Determine if we should use tools
+        # Keywords that suggest tool use might be needed
+        tool_keywords = ['contact', 'email', 'phone', 'people', 'person', 'how many', 
+                        'who is', "who's", 'invite', 'birthday', 'address']
+        might_need_tools = any(kw in question.lower() for kw in tool_keywords)
+        
+        # First API call - with or without tools
+        api_params = {
+            'model': 'claude-sonnet-4-20250514',
+            'max_tokens': 1000,
+            'system': system_prompt,
+            'messages': messages
+        }
+        
+        if might_need_tools:
+            # Filter tools based on user permissions
+            available_tools = CLAUDE_TOOLS.copy()
+            if not tracker_access:
+                available_tools = [t for t in available_tools if t['name'] != 'get_spend_summary']
+            if user_mode == 'client' and user_client:
+                # Client users can only query their own client
+                # We'll enforce this in tool execution
+                pass
+            
+            api_params['tools'] = available_tools
+        
         response = requests.post(
             'https://api.anthropic.com/v1/messages',
             headers={
@@ -895,19 +1449,73 @@ REMEMBER: You're helpful first. Most questions have a yes answer. Find it."""
                 'anthropic-version': '2023-06-01',
                 'content-type': 'application/json'
             },
-            json={
-                'model': 'claude-sonnet-4-20250514',
-                'max_tokens': 500,
-                'system': system_prompt,
-                'messages': messages
-            }
+            json=api_params
         )
         
         response.raise_for_status()
         result = response.json()
         
-        # Extract Claude's response
-        assistant_message = result.get('content', [{}])[0].get('text', '{}')
+        # Check if Claude wants to use tools
+        stop_reason = result.get('stop_reason')
+        content_blocks = result.get('content', [])
+        
+        if stop_reason == 'tool_use':
+            # Claude wants to use a tool
+            tool_results = []
+            
+            for block in content_blocks:
+                if block.get('type') == 'tool_use':
+                    tool_name = block.get('name')
+                    tool_input = block.get('input', {})
+                    tool_id = block.get('id')
+                    
+                    # Enforce client restrictions
+                    if user_mode == 'client' and user_client:
+                        if 'client_code' in tool_input:
+                            tool_input['client_code'] = user_client
+                        elif tool_name in ['get_client_detail', 'get_spend_summary']:
+                            tool_input['client_code'] = user_client
+                    
+                    # Execute the tool
+                    print(f"Executing tool: {tool_name} with input: {tool_input}")
+                    tool_result = execute_tool(tool_name, tool_input)
+                    print(f"Tool result: {tool_result}")
+                    
+                    tool_results.append({
+                        'type': 'tool_result',
+                        'tool_use_id': tool_id,
+                        'content': json.dumps(tool_result)
+                    })
+            
+            # Second API call with tool results
+            messages.append({'role': 'assistant', 'content': content_blocks})
+            messages.append({'role': 'user', 'content': tool_results})
+            
+            response2 = requests.post(
+                'https://api.anthropic.com/v1/messages',
+                headers={
+                    'x-api-key': ANTHROPIC_API_KEY,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json'
+                },
+                json={
+                    'model': 'claude-sonnet-4-20250514',
+                    'max_tokens': 1000,
+                    'system': system_prompt,
+                    'messages': messages
+                }
+            )
+            
+            response2.raise_for_status()
+            result = response2.json()
+            content_blocks = result.get('content', [])
+        
+        # Extract the text response
+        assistant_message = ''
+        for block in content_blocks:
+            if block.get('type') == 'text':
+                assistant_message = block.get('text', '')
+                break
         
         # Try to parse as JSON
         try:
