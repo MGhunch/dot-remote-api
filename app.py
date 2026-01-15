@@ -188,7 +188,7 @@ def transform_project(record):
         'jobName': fields.get('Project Name', ''),
         'clientCode': extract_client_code(job_number),
         'client': fields.get('Client', ''),
-        'description': fields.get('Description', ''),
+        'description': fields.get('Tracker notes', ''),
         'projectOwner': fields.get('Project Owner', ''),
         'update': latest_update,
         'updateDue': update_due,
@@ -734,7 +734,7 @@ def get_tracker_data():
                     'jobNumber': job_number,
                     'projectName': project.get('projectName', ''),
                     'owner': project.get('owner', ''),
-                    'description': fields.get('Description', ''),
+                    'description': fields.get('Tracker notes', ''),
                     'spend': spend,
                     'month': fields.get('Month', ''),
                     'spendType': fields.get('Spend type', 'Project budget'),
@@ -778,7 +778,7 @@ def update_tracker_record():
         # Map frontend fields to Airtable Tracker fields
         # Note: Project Name and Owner live in Projects table, not Tracker
         field_mapping = {
-            'description': 'Description',
+            'description': 'Tracker notes',
             'spend': 'Spend',
             'month': 'Month',
             'spendType': 'Spend type',
@@ -821,18 +821,20 @@ def update_tracker_record():
 def get_tracker_summary():
     """
     Get a spend summary for a client and period.
+    Uses pre-calculated quarter columns from Clients table.
+    
     Query params:
     - client: client code (required)
-    - period: month name, "this_month", "last_month", "Q1"-"Q4", "this_quarter", "last_quarter"
+    - period: "this_month", "last_month", "this_quarter", "last_quarter", or quarter name like "JAN-MAR"
     """
     client_code = request.args.get('client')
-    period = request.args.get('period', 'this_month')
+    period = request.args.get('period', 'this_quarter')
     
     if not client_code:
         return jsonify({'error': 'client parameter required'}), 400
     
     try:
-        # Get client info (budget, quarter info)
+        # Get client info from Clients table (has pre-calculated quarter spend)
         clients_url = get_airtable_url('Clients')
         clients_response = requests.get(clients_url, headers=HEADERS)
         clients_response.raise_for_status()
@@ -841,125 +843,121 @@ def get_tracker_summary():
         for record in clients_response.json().get('records', []):
             fields = record.get('fields', {})
             if fields.get('Client code', '') == client_code:
+                # Parse monthly committed
                 monthly_committed = fields.get('Monthly Committed', 0)
                 if isinstance(monthly_committed, str):
-                    monthly_committed = int(monthly_committed.replace('$', '').replace(',', '') or 0)
+                    monthly_committed = float(monthly_committed.replace('$', '').replace(',', '') or 0)
                 
+                # Parse rollover credit (might be a list from lookup)
                 rollover = fields.get('Rollover Credit', 0)
                 if isinstance(rollover, list):
                     rollover = rollover[0] if rollover else 0
                 if isinstance(rollover, str):
-                    rollover = int(rollover.replace('$', '').replace(',', '') or 0)
+                    rollover = float(rollover.replace('$', '').replace(',', '') or 0)
+                
+                # Get rollover use quarter
+                rollover_use = fields.get('Rollover use', '')
+                
+                # Get pre-calculated quarter spends
+                def parse_spend(val):
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    if isinstance(val, str):
+                        return float(val.replace('$', '').replace(',', '') or 0)
+                    return 0
                 
                 client_info = {
                     'name': fields.get('Clients', ''),
                     'code': client_code,
                     'monthlyBudget': monthly_committed,
+                    'quarterlyBudget': monthly_committed * 3,
                     'currentQuarter': fields.get('Current Quarter', ''),
-                    'rollover': rollover
+                    'yearEnd': fields.get('Year end', ''),
+                    'rollover': rollover,
+                    'rolloverUse': rollover_use,
+                    # Pre-calculated quarter spends from Airtable
+                    'JAN-MAR': parse_spend(fields.get('JAN-MAR', 0)),
+                    'APR-JUN': parse_spend(fields.get('APR-JUN', 0)),
+                    'JUL-SEP': parse_spend(fields.get('JUL-SEP', 0)),
+                    'OCT-DEC': parse_spend(fields.get('OCT-DEC', 0)),
+                    # This month/quarter from Airtable
+                    'thisMonth': parse_spend(fields.get('This month', 0)),
+                    'thisQuarter': parse_spend(fields.get('This Quarter', 0)),
                 }
                 break
         
         if not client_info:
             return jsonify({'error': f'Client {client_code} not found'}), 404
         
-        # Figure out which months to query
+        # Map period to quarter column
         now = datetime.now()
-        current_month = now.strftime('%B')  # "January"
         current_month_num = now.month
         
-        months_to_query = []
-        period_label = period
-        is_quarter = False
+        # Determine which calendar quarter we're in
+        calendar_quarters = {
+            1: 'JAN-MAR', 2: 'JAN-MAR', 3: 'JAN-MAR',
+            4: 'APR-JUN', 5: 'APR-JUN', 6: 'APR-JUN',
+            7: 'JUL-SEP', 8: 'JUL-SEP', 9: 'JUL-SEP',
+            10: 'OCT-DEC', 11: 'OCT-DEC', 12: 'OCT-DEC'
+        }
+        current_cal_quarter = calendar_quarters[current_month_num]
         
-        # Parse period
-        if period == 'this_month':
-            months_to_query = [current_month]
-            period_label = current_month
-        elif period == 'last_month':
-            last_month_num = current_month_num - 1 if current_month_num > 1 else 12
-            last_month_name = datetime(2024, last_month_num, 1).strftime('%B')
-            months_to_query = [last_month_name]
-            period_label = last_month_name
-        elif period in ['Q1', 'Q2', 'Q3', 'Q4']:
-            is_quarter = True
-            quarter_months = {
-                'Q1': ['January', 'February', 'March'],
-                'Q2': ['April', 'May', 'June'],
-                'Q3': ['July', 'August', 'September'],
-                'Q4': ['October', 'November', 'December']
-            }
-            months_to_query = quarter_months.get(period, [])
-            period_label = period
-        elif period == 'this_quarter':
-            is_quarter = True
-            quarter = (current_month_num - 1) // 3 + 1
-            quarter_months = {
-                1: ['January', 'February', 'March'],
-                2: ['April', 'May', 'June'],
-                3: ['July', 'August', 'September'],
-                4: ['October', 'November', 'December']
-            }
-            months_to_query = quarter_months.get(quarter, [])
-            period_label = f'Q{quarter}'
+        # Previous calendar quarter
+        prev_quarters = {
+            'JAN-MAR': 'OCT-DEC',
+            'APR-JUN': 'JAN-MAR',
+            'JUL-SEP': 'APR-JUN',
+            'OCT-DEC': 'JUL-SEP'
+        }
+        last_cal_quarter = prev_quarters[current_cal_quarter]
+        
+        # Figure out what to return based on period
+        if period == 'this_quarter':
+            quarter_key = current_cal_quarter
+            period_label = client_info['currentQuarter']  # Use client's Q label (e.g., "Q2" for Tower)
         elif period == 'last_quarter':
-            is_quarter = True
-            quarter = (current_month_num - 1) // 3
-            if quarter == 0:
-                quarter = 4
-            quarter_months = {
-                1: ['January', 'February', 'March'],
-                2: ['April', 'May', 'June'],
-                3: ['July', 'August', 'September'],
-                4: ['October', 'November', 'December']
-            }
-            months_to_query = quarter_months.get(quarter, [])
-            period_label = f'Q{quarter}'
-        else:
-            # Assume it's a month name like "January", "February"
-            months_to_query = [period.capitalize()]
-            period_label = period.capitalize()
-        
-        # Get tracker data for this client
-        tracker_url = get_airtable_url('Tracker')
-        tracker_filter = f"{{Client Code}} = '{client_code}'"
-        
-        total_spent = 0
-        offset = None
-        
-        while True:
-            params = {'filterByFormula': tracker_filter}
-            if offset:
-                params['offset'] = offset
-            
-            response = requests.get(tracker_url, headers=HEADERS, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            for record in data.get('records', []):
-                fields = record.get('fields', {})
-                month = fields.get('Month', '')
-                
-                if month in months_to_query:
-                    spend = fields.get('Spend', 0)
-                    if isinstance(spend, str):
-                        spend = int(spend.replace('$', '').replace(',', '') or 0)
-                    # Don't count "On us" items
-                    if not fields.get('On us', False):
-                        total_spent += spend
-            
-            offset = data.get('offset')
-            if not offset:
-                break
-        
-        # Calculate budget for period
-        if is_quarter:
-            budget = client_info['monthlyBudget'] * 3 + client_info['rollover']
-        else:
+            quarter_key = last_cal_quarter
+            # Calculate client's previous quarter label
+            current_q_num = int(client_info['currentQuarter'].replace('Q', '') or 1)
+            last_q_num = current_q_num - 1 if current_q_num > 1 else 4
+            period_label = f'Q{last_q_num}'
+        elif period in ['JAN-MAR', 'APR-JUN', 'JUL-SEP', 'OCT-DEC']:
+            quarter_key = period
+            period_label = period
+        elif period == 'this_month':
+            # For monthly, use the This month column
+            spent = client_info['thisMonth']
             budget = client_info['monthlyBudget']
+            remaining = budget - spent
+            percent_used = round((spent / budget * 100) if budget > 0 else 0)
+            
+            return jsonify({
+                'client': client_info['name'],
+                'clientCode': client_code,
+                'period': now.strftime('%B'),
+                'budget': budget,
+                'spent': spent,
+                'remaining': remaining,
+                'percentUsed': percent_used,
+                'status': 'over' if percent_used > 100 else ('high' if percent_used > 80 else 'on_track')
+            })
+        else:
+            # Default to this quarter
+            quarter_key = current_cal_quarter
+            period_label = client_info['currentQuarter']
         
-        remaining = budget - total_spent
-        percent_used = round((total_spent / budget * 100) if budget > 0 else 0)
+        # Get spent from pre-calculated column
+        spent = client_info.get(quarter_key, 0)
+        
+        # Calculate budget (quarterly + rollover if applicable)
+        budget = client_info['quarterlyBudget']
+        
+        # Add rollover if it applies to this quarter
+        if client_info['rolloverUse'] == quarter_key and client_info['rollover'] > 0:
+            budget += client_info['rollover']
+        
+        remaining = budget - spent
+        percent_used = round((spent / budget * 100) if budget > 0 else 0)
         
         # Determine status
         if percent_used > 100:
@@ -974,13 +972,16 @@ def get_tracker_summary():
             'clientCode': client_code,
             'period': period_label,
             'budget': budget,
-            'spent': total_spent,
+            'spent': spent,
             'remaining': remaining,
             'percentUsed': percent_used,
-            'status': status
+            'status': status,
+            'rolloverApplied': client_info['rolloverUse'] == quarter_key and client_info['rollover'] > 0,
+            'rolloverAmount': client_info['rollover'] if client_info['rolloverUse'] == quarter_key else 0
         })
     
     except Exception as e:
+        app.logger.error(f"Tracker summary error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -1090,13 +1091,12 @@ def tool_get_client_detail(client_code):
         return {'error': str(e)}
 
 
-def tool_get_spend_summary(client_code, period='this_month'):
+def tool_get_spend_summary(client_code, period='this_quarter'):
     """
-    Get spend summary for a client. Returns formatted results for Claude.
+    Get spend summary for a client using pre-calculated quarter columns.
+    Returns formatted results for Claude.
     """
     try:
-        # Reuse the existing tracker summary logic
-        # This is a simplified version for tool use
         clients_url = get_airtable_url('Clients')
         clients_response = requests.get(clients_url, headers=HEADERS)
         clients_response.raise_for_status()
@@ -1105,101 +1105,102 @@ def tool_get_spend_summary(client_code, period='this_month'):
         for record in clients_response.json().get('records', []):
             fields = record.get('fields', {})
             if fields.get('Client code', '') == client_code:
-                monthly = fields.get('Monthly Committed', 0)
-                if isinstance(monthly, str):
-                    monthly = int(monthly.replace('$', '').replace(',', '') or 0)
+                def parse_currency(val):
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    if isinstance(val, str):
+                        return float(val.replace('$', '').replace(',', '') or 0)
+                    if isinstance(val, list):
+                        return float(val[0]) if val else 0
+                    return 0
                 
-                rollover = fields.get('Rollover Credit', 0)
-                if isinstance(rollover, list):
-                    rollover = rollover[0] if rollover else 0
-                if isinstance(rollover, str):
-                    rollover = int(rollover.replace('$', '').replace(',', '') or 0)
+                monthly = parse_currency(fields.get('Monthly Committed', 0))
+                rollover = parse_currency(fields.get('Rollover Credit', 0))
+                rollover_use = fields.get('Rollover use', '')
                 
                 client_info = {
                     'name': fields.get('Clients', ''),
+                    'code': client_code,
                     'monthlyBudget': monthly,
-                    'rollover': rollover
+                    'quarterlyBudget': monthly * 3,
+                    'currentQuarter': fields.get('Current Quarter', ''),
+                    'rollover': rollover,
+                    'rolloverUse': rollover_use,
+                    # Pre-calculated quarter spends
+                    'JAN-MAR': parse_currency(fields.get('JAN-MAR', 0)),
+                    'APR-JUN': parse_currency(fields.get('APR-JUN', 0)),
+                    'JUL-SEP': parse_currency(fields.get('JUL-SEP', 0)),
+                    'OCT-DEC': parse_currency(fields.get('OCT-DEC', 0)),
+                    'thisMonth': parse_currency(fields.get('This month', 0)),
                 }
                 break
         
         if not client_info:
             return {'error': f'Client {client_code} not found'}
         
-        # Determine months to query
+        # Map period to quarter column
         now = datetime.now()
-        current_month = now.strftime('%B')
         current_month_num = now.month
         
-        months_to_query = []
-        is_quarter = False
+        calendar_quarters = {
+            1: 'JAN-MAR', 2: 'JAN-MAR', 3: 'JAN-MAR',
+            4: 'APR-JUN', 5: 'APR-JUN', 6: 'APR-JUN',
+            7: 'JUL-SEP', 8: 'JUL-SEP', 9: 'JUL-SEP',
+            10: 'OCT-DEC', 11: 'OCT-DEC', 12: 'OCT-DEC'
+        }
+        current_cal_quarter = calendar_quarters[current_month_num]
         
-        if period == 'this_month':
-            months_to_query = [current_month]
-        elif period == 'this_quarter':
-            is_quarter = True
-            quarter = (current_month_num - 1) // 3 + 1
-            quarter_months = {
-                1: ['January', 'February', 'March'],
-                2: ['April', 'May', 'June'],
-                3: ['July', 'August', 'September'],
-                4: ['October', 'November', 'December']
+        prev_quarters = {
+            'JAN-MAR': 'OCT-DEC',
+            'APR-JUN': 'JAN-MAR',
+            'JUL-SEP': 'APR-JUN',
+            'OCT-DEC': 'JUL-SEP'
+        }
+        last_cal_quarter = prev_quarters[current_cal_quarter]
+        
+        # Determine quarter key and label based on period
+        if period == 'this_quarter':
+            quarter_key = current_cal_quarter
+            period_label = client_info['currentQuarter']
+        elif period == 'last_quarter':
+            quarter_key = last_cal_quarter
+            current_q_num = int(client_info['currentQuarter'].replace('Q', '') or 1)
+            last_q_num = current_q_num - 1 if current_q_num > 1 else 4
+            period_label = f'Q{last_q_num}'
+        elif period in ['JAN-MAR', 'APR-JUN', 'JUL-SEP', 'OCT-DEC']:
+            quarter_key = period
+            period_label = period
+        elif period == 'this_month':
+            return {
+                'client': client_info['name'],
+                'clientCode': client_code,
+                'period': now.strftime('%B'),
+                'budget': client_info['monthlyBudget'],
+                'spent': client_info['thisMonth'],
+                'remaining': client_info['monthlyBudget'] - client_info['thisMonth'],
+                'percentUsed': round((client_info['thisMonth'] / client_info['monthlyBudget'] * 100) if client_info['monthlyBudget'] > 0 else 0)
             }
-            months_to_query = quarter_months.get(quarter, [])
-        elif period in ['Q1', 'Q2', 'Q3', 'Q4']:
-            is_quarter = True
-            quarter_months = {
-                'Q1': ['January', 'February', 'March'],
-                'Q2': ['April', 'May', 'June'],
-                'Q3': ['July', 'August', 'September'],
-                'Q4': ['October', 'November', 'December']
-            }
-            months_to_query = quarter_months.get(period, [])
         else:
-            months_to_query = [period.capitalize()]
+            quarter_key = current_cal_quarter
+            period_label = client_info['currentQuarter']
         
-        # Sum spend
-        tracker_url = get_airtable_url('Tracker')
-        tracker_filter = f"{{Client Code}} = '{client_code}'"
+        spent = client_info.get(quarter_key, 0)
+        budget = client_info['quarterlyBudget']
         
-        total_spent = 0
-        offset = None
-        
-        while True:
-            params = {'filterByFormula': tracker_filter}
-            if offset:
-                params['offset'] = offset
-            
-            response = requests.get(tracker_url, headers=HEADERS, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            for record in data.get('records', []):
-                fields = record.get('fields', {})
-                month = fields.get('Month', '')
-                
-                if month in months_to_query:
-                    spend = fields.get('Spend', 0)
-                    if isinstance(spend, str):
-                        spend = int(spend.replace('$', '').replace(',', '') or 0)
-                    if not fields.get('On us', False):
-                        total_spent += spend
-            
-            offset = data.get('offset')
-            if not offset:
-                break
-        
-        budget = client_info['monthlyBudget'] * (3 if is_quarter else 1)
-        if is_quarter:
+        # Add rollover if applicable
+        if client_info['rolloverUse'] == quarter_key and client_info['rollover'] > 0:
             budget += client_info['rollover']
         
         return {
             'client': client_info['name'],
             'clientCode': client_code,
-            'period': period,
+            'period': period_label,
             'budget': budget,
-            'spent': total_spent,
-            'remaining': budget - total_spent,
-            'percentUsed': round((total_spent / budget * 100) if budget > 0 else 0)
+            'spent': spent,
+            'remaining': budget - spent,
+            'percentUsed': round((spent / budget * 100) if budget > 0 else 0),
+            'rolloverApplied': client_info['rolloverUse'] == quarter_key and client_info['rollover'] > 0,
+            'rolloverAmount': client_info['rollover'] if client_info['rolloverUse'] == quarter_key else 0
         }
     
     except Exception as e:
