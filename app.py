@@ -403,34 +403,6 @@ def get_tracker_data():
         return jsonify({'error': 'Client code required'}), 400
     
     try:
-        # First, get all projects and build a map by RECORD ID
-        projects_url = get_airtable_url('Projects')
-        projects_map = {}
-        offset = None
-        
-        while True:
-            params = {'filterByFormula': f"FIND('{client_code}', {{Job Number}})"}
-            if offset:
-                params['offset'] = offset
-            
-            projects_response = requests.get(projects_url, headers=HEADERS, params=params)
-            projects_response.raise_for_status()
-            data = projects_response.json()
-            
-            for record in data.get('records', []):
-                record_id = record.get('id')
-                fields = record.get('fields', {})
-                projects_map[record_id] = {
-                    'jobNumber': fields.get('Job Number', ''),
-                    'projectName': fields.get('Project Name', ''),
-                    'owner': fields.get('Project Owner', '')
-                }
-            
-            offset = data.get('offset')
-            if not offset:
-                break
-        
-        # Now get tracker data
         tracker_url = get_airtable_url('Tracker')
         
         all_records = []
@@ -450,16 +422,18 @@ def get_tracker_data():
             for record in data.get('records', []):
                 fields = record.get('fields', {})
                 
-                # Job Number is a linked field - returns list of record IDs
-                job_link = fields.get('Job', [])
-                if isinstance(job_link, list):
-                    job_record_id = job_link[0] if job_link else None
-                else:
-                    job_record_id = job_link
+                # Job Number and Project Name are lookup fields from linked Projects
+                job_number = fields.get('Job Number', '')
+                if isinstance(job_number, list):
+                    job_number = job_number[0] if job_number else ''
                 
-                # Look up project details by record ID
-                project = projects_map.get(job_record_id, {})
-                job_number = project.get('jobNumber', '')
+                project_name = fields.get('Project Name', '')
+                if isinstance(project_name, list):
+                    project_name = project_name[0] if project_name else ''
+                
+                owner = fields.get('Owner', '')
+                if isinstance(owner, list):
+                    owner = owner[0] if owner else ''
                 
                 spend = fields.get('Spend', 0)
                 if isinstance(spend, str):
@@ -472,8 +446,8 @@ def get_tracker_data():
                     'id': record.get('id'),
                     'client': client_code,
                     'jobNumber': job_number,
-                    'projectName': project.get('projectName', ''),
-                    'owner': project.get('owner', ''),
+                    'projectName': project_name,
+                    'owner': owner,
                     'description': fields.get('Tracker notes', ''),
                     'spend': spend,
                     'month': fields.get('Month', ''),
