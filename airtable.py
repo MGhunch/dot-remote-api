@@ -4,6 +4,7 @@ All reads and writes to Airtable: Projects, Clients, Traffic table
 """
 
 import os
+import re
 import httpx
 from datetime import datetime
 
@@ -20,6 +21,64 @@ TRAFFIC_TABLE = 'Traffic'
 UPDATES_TABLE = 'Updates'
 
 TIMEOUT = 10.0
+
+
+# ===================
+# DATE PARSING HELPERS (same as dot-hub-api)
+# ===================
+
+def parse_friendly_date(friendly_str):
+    """Parse friendly date formats into ISO format"""
+    if not friendly_str or friendly_str.upper() == 'TBC':
+        return None
+    
+    match = re.search(r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', friendly_str, re.IGNORECASE)
+    if match:
+        day = int(match.group(1))
+        month_str = match.group(2).capitalize()
+        months = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                  'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+        month = months.get(month_str)
+        if month:
+            year = datetime.now().year
+            try:
+                date = datetime(year, month, day)
+                if (datetime.now() - date).days > 180:
+                    date = datetime(year + 1, month, day)
+                return date.strftime('%Y-%m-%d')
+            except ValueError:
+                return None
+    
+    try:
+        date = datetime.strptime(friendly_str, '%d %B %Y')
+        return date.strftime('%Y-%m-%d')
+    except ValueError:
+        pass
+    
+    return None
+
+
+def parse_status_changed(status_str):
+    """Parse Status Changed field into ISO date"""
+    if not status_str:
+        return None
+    
+    if 'T' in status_str:
+        try:
+            date_part = status_str.split('T')[0]
+            return date_part
+        except:
+            pass
+    
+    match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', status_str)
+    if match:
+        day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        try:
+            return datetime(year, month, day).strftime('%Y-%m-%d')
+        except ValueError:
+            return None
+    
+    return None
 
 
 def _headers():
@@ -254,15 +313,22 @@ def get_active_jobs(client_code):
             fields = record.get('fields', {})
             job_number = fields.get('Job Number', '')
             
-            # Get update text - same fields as dot-hub-api
+            # Get update text - same as dot-hub-api
             update_summary = fields.get('Update Summary', '') or fields.get('Update', '')
             latest_update = update_summary
             if '|' in update_summary:
                 parts = update_summary.split('|')
                 latest_update = parts[-1].strip() if parts else update_summary
             
-            # Get last updated date - same field as dot-hub-api
-            last_updated = fields.get('Last update made', '')
+            # Parse dates - same as dot-hub-api
+            update_due_friendly = fields.get('Update due friendly', '')
+            update_due = parse_friendly_date(update_due_friendly)
+            
+            live_date_raw = fields.get('Live Date', '')
+            live_date = parse_friendly_date(live_date_raw) if live_date_raw else None
+            
+            last_update_made = fields.get('Last update made', '')
+            last_updated = parse_status_changed(last_update_made)
             
             # Get update history - could be array or string
             update_history_raw = fields.get('Update history', [])
@@ -279,13 +345,13 @@ def get_active_jobs(client_code):
                 'description': fields.get('Description', ''),
                 'stage': fields.get('Stage', ''),
                 'status': fields.get('Status', ''),
-                'updateDue': fields.get('Update due friendly', ''),
+                'updateDue': update_due,
                 'withClient': fields.get('With Client?', False),
                 'clientCode': job_number.split()[0] if job_number else '',
                 'update': latest_update,
                 'lastUpdated': last_updated,
                 'updateHistory': update_history,
-                'liveDate': fields.get('Live Date', ''),
+                'liveDate': live_date,
             })
         
         return jobs
@@ -328,15 +394,22 @@ def get_all_active_jobs():
             fields = record.get('fields', {})
             job_number = fields.get('Job Number', '')
             
-            # Get update text - same fields as dot-hub-api
+            # Get update text - same as dot-hub-api
             update_summary = fields.get('Update Summary', '') or fields.get('Update', '')
             latest_update = update_summary
             if '|' in update_summary:
                 parts = update_summary.split('|')
                 latest_update = parts[-1].strip() if parts else update_summary
             
-            # Get last updated date - same field as dot-hub-api
-            last_updated = fields.get('Last update made', '')
+            # Parse dates - same as dot-hub-api
+            update_due_friendly = fields.get('Update due friendly', '')
+            update_due = parse_friendly_date(update_due_friendly)
+            
+            live_date_raw = fields.get('Live Date', '')
+            live_date = parse_friendly_date(live_date_raw) if live_date_raw else None
+            
+            last_update_made = fields.get('Last update made', '')
+            last_updated = parse_status_changed(last_update_made)
             
             # Get update history - could be array or string
             update_history_raw = fields.get('Update history', [])
@@ -353,13 +426,13 @@ def get_all_active_jobs():
                 'description': fields.get('Description', ''),
                 'stage': fields.get('Stage', ''),
                 'status': fields.get('Status', ''),
-                'updateDue': fields.get('Update due friendly', ''),
+                'updateDue': update_due,
                 'withClient': fields.get('With Client?', False),
                 'clientCode': job_number.split()[0] if job_number else '',
                 'update': latest_update,
                 'lastUpdated': last_updated,
                 'updateHistory': update_history,
-                'liveDate': fields.get('Live Date', ''),
+                'liveDate': live_date,
             })
         
         return jobs
@@ -405,15 +478,22 @@ def get_job_by_number(job_number):
         
         fields = records[0].get('fields', {})
         
-        # Get update text - same fields as dot-hub-api
+        # Get update text - same as dot-hub-api
         update_summary = fields.get('Update Summary', '') or fields.get('Update', '')
         latest_update = update_summary
         if '|' in update_summary:
             parts = update_summary.split('|')
             latest_update = parts[-1].strip() if parts else update_summary
         
-        # Get last updated date - same field as dot-hub-api
-        last_updated = fields.get('Last update made', '')
+        # Parse dates - same as dot-hub-api
+        update_due_friendly = fields.get('Update due friendly', '')
+        update_due = parse_friendly_date(update_due_friendly)
+        
+        live_date_raw = fields.get('Live Date', '')
+        live_date = parse_friendly_date(live_date_raw) if live_date_raw else None
+        
+        last_update_made = fields.get('Last update made', '')
+        last_updated = parse_status_changed(last_update_made)
         
         # Get update history - could be array or string
         update_history_raw = fields.get('Update history', [])
@@ -430,13 +510,13 @@ def get_job_by_number(job_number):
             'description': fields.get('Description', ''),
             'stage': fields.get('Stage', ''),
             'status': fields.get('Status', ''),
-            'updateDue': fields.get('Update due friendly', ''),
+            'updateDue': update_due,
             'withClient': fields.get('With Client?', False),
             'clientCode': job_number.split()[0] if job_number else '',
             'update': latest_update,
             'lastUpdated': last_updated,
             'updateHistory': update_history,
-            'liveDate': fields.get('Live Date', ''),
+            'liveDate': live_date,
         }
         
     except Exception as e:
